@@ -1,8 +1,8 @@
 // ==WindhawkMod==
-// @id              move-window-to-monitor
+// @id              move-app-window-to-monitor
 // @name            Move Window to Monitor
 // @description     Easily move windows between monitors using hotkeys or taskbar thumbnail/titlebar menu, with one-click rescue for windows lost on disconnected displays.
-// @version         1.2.0
+// @version         1.0.0
 // @author          heartacker
 // @github          https://github.com/heartacker
 // @include         *
