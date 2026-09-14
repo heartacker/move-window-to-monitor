@@ -1,11 +1,11 @@
 // ==WindhawkMod==
 // @id              move-window-to-monitor
 // @name            Move Window to Monitor
-// @description     Easily move windows between monitors using hotkeys or a tray menu, with one-click rescue for windows lost on disconnected displays.
-// @version         1.1.0
+// @description     Easily move windows between monitors using hotkeys, taskbar thumbnail/titlebar menu, or a tray menu, with one-click rescue for windows lost on disconnected displays.
+// @version         1.2.0
 // @author          heartacker
 // @github          https://github.com/heartacker
-// @include         explorer.exe
+// @include         *
 // @compilerOptions -luser32 -lshell32 -lgdi32
 // ==/WindhawkMod==
 
@@ -16,12 +16,13 @@
 专为多显示器、外接屏幕断开/虚显（幽灵屏）、向日葵等远程控制场景打造的窗口调度与救援工具。
 
 ### 核心功能：
-1. **任务栏缩略图预览菜单（右键预览框）**：
-   - 鼠标悬停在任务栏图标上，右键点击弹出的缩略图预览窗口，菜单中直接新增：
+1. **任务栏预览右键 & 窗口标题栏右键菜单集成**：
+   - 鼠标悬停在任务栏图标的缩略图预览上点击右键，或者直接右键窗口标题栏：
      - `🖥️ 移至显示器 1 (主屏幕)`
      - `🖥️ 移至显示器 2`
      - `➡️ 移至下一个显示器`
      - `🔄 召回所有窗口到主屏幕`
+   - 支持所有应用程序（Chrome、Edge、资源管理器、VSCode 等）。
 2. **全局快捷键**：
    - `Win + Alt + 1`：将当前窗口移动到显示器 1（主屏）
    - `Win + Alt + 2`：将当前窗口移动到显示器 2
@@ -109,7 +110,7 @@ enum {
     IDM_OPEN_SETTINGS,
     IDM_APP_MENU_BASE = 4000, // 4000 + (appIndex * 10) + targetMonIndex
 
-    // Custom Taskbar Thumbnail Context Menu IDs (0xE700 - 0xE750)
+    // Custom Context Menu IDs
     IDM_CUSTOM_MOVE_BASE = 0xE700,
     IDM_CUSTOM_MOVE_NEXT = 0xE720,
     IDM_CUSTOM_RESCUE    = 0xE721,
@@ -123,6 +124,7 @@ static DWORD s_dwThreadId = 0;
 static HWND s_hHelperWnd = nullptr;
 static NOTIFYICONDATAW s_nid = {};
 static HWND s_hLastActiveAppWnd = nullptr;
+static bool s_isExplorer = false;
 
 // Forward Declarations
 std::vector<MonitorInfo> GetAllMonitors();
@@ -132,6 +134,17 @@ void MoveForegroundWindowToPrevOrNext(bool next);
 void RescueAllWindowsToPrimary();
 void UpdateTrayIcon(bool show);
 HWND GetTrackedTargetWindow();
+
+bool CheckIsExplorer() {
+    WCHAR processPath[MAX_PATH];
+    if (GetModuleFileNameW(nullptr, processPath, ARRAYSIZE(processPath)) > 0) {
+        PCWSTR processName = wcsrchr(processPath, L'\\');
+        if (processName && _wcsicmp(processName + 1, L"explorer.exe") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static BOOL CALLBACK EnumMonitorsCallback(HMONITOR hMon, HDC hdc, LPRECT lpRect, LPARAM lParam) {
     (void)hdc;
@@ -225,6 +238,11 @@ HWND GetTrackedTargetWindow() {
 // Move target window to destination monitor
 void MoveWindowToMonitor(HWND hWnd, const MonitorInfo& targetMon) {
     if (!IsWindow(hWnd)) return;
+
+    HWND hTopWnd = GetAncestor(hWnd, GA_ROOT);
+    if (hTopWnd && IsWindow(hTopWnd)) {
+        hWnd = hTopWnd;
+    }
 
     WINDOWPLACEMENT wp = { sizeof(wp) };
     if (!GetWindowPlacement(hWnd, &wp)) return;
@@ -383,9 +401,8 @@ void RescueAllWindowsToPrimary() {
     }
 }
 
-// Register or unregister global hotkeys
+// Register or unregister global hotkeys (only inside explorer.exe)
 void RegisterHotkeys(HWND hWnd) {
-    // Unregister first
     for (int id = HOTKEY_ID_MON1; id <= HOTKEY_ID_RESCUE_HOME; ++id) {
         UnregisterHotKey(hWnd, id);
     }
@@ -536,7 +553,6 @@ void ShowTrayContextMenu(HWND hWndHelper) {
     } else if (cmd == IDM_RESCUE_ALL) {
         RescueAllWindowsToPrimary();
     } else if (cmd >= IDM_APP_MENU_BASE) {
-        // App submenu command
         int appIdx = (cmd - IDM_APP_MENU_BASE) / 10;
         int targetMonIdx = (cmd - IDM_APP_MENU_BASE) % 10;
         if (appIdx >= 0 && appIdx < static_cast<int>(appList.size())) {
@@ -551,7 +567,7 @@ void ShowTrayContextMenu(HWND hWndHelper) {
 }
 
 // ----------------------------------------------------------------------------------
-// Taskbar Thumbnail / System Menu Hooking via TrackPopupMenuEx & TrackPopupMenu
+// Taskbar Thumbnail / Window System Menu Hooking via TrackPopupMenuEx & TrackPopupMenu
 // ----------------------------------------------------------------------------------
 
 using TrackPopupMenuEx_t = BOOL(WINAPI*)(HMENU, UINT, int, int, HWND, LPTPMPARAMS);
@@ -573,7 +589,7 @@ static BOOL ProcessTrackPopupMenu(
     BOOL* pHandled,
     BOOL* pResult
 ) {
-    if (!hMenu || !hWnd || !IsWindow(hWnd)) {
+    if (!hMenu) {
         *pHandled = FALSE;
         return FALSE;
     }
@@ -581,21 +597,32 @@ static BOOL ProcessTrackPopupMenu(
     // Check if this menu is a window system/thumbnail menu (contains SC_CLOSE, SC_RESTORE, or SC_MINIMIZE)
     bool isSystemOrThumbMenu = (GetMenuState(hMenu, SC_CLOSE, MF_BYCOMMAND) != (UINT)-1) ||
                                (GetMenuState(hMenu, SC_RESTORE, MF_BYCOMMAND) != (UINT)-1) ||
-                               (GetMenuState(hMenu, SC_MINIMIZE, MF_BYCOMMAND) != (UINT)-1);
+                               (GetMenuState(hMenu, SC_MINIMIZE, MF_BYCOMMAND) != (UINT)-1) ||
+                               (GetMenuState(hMenu, SC_MAXIMIZE, MF_BYCOMMAND) != (UINT)-1);
 
     if (!isSystemOrThumbMenu) {
         *pHandled = FALSE;
         return FALSE;
     }
 
-    Wh_Log(L"ProcessTrackPopupMenu detected system/thumbnail menu for hWnd=%p", hWnd);
+    HWND hTargetWnd = hWnd;
+    if (hTargetWnd && IsWindow(hTargetWnd)) {
+        HWND hRoot = GetAncestor(hTargetWnd, GA_ROOT);
+        if (hRoot && IsWindow(hRoot)) {
+            hTargetWnd = hRoot;
+        }
+    } else {
+        hTargetWnd = GetForegroundWindow();
+    }
+
+    Wh_Log(L"ProcessTrackPopupMenu detected system/thumbnail menu for hWnd=%p, targetWnd=%p", hWnd, hTargetWnd);
 
     // If not already appended, add our menu items
     if (GetMenuState(hMenu, IDM_CUSTOM_MOVE_NEXT, MF_BYCOMMAND) == (UINT)-1) {
         AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
 
         auto monitors = GetAllMonitors();
-        int curMon = GetWindowMonitorIndex(hWnd, monitors);
+        int curMon = hTargetWnd ? GetWindowMonitorIndex(hTargetWnd, monitors) : 0;
 
         for (const auto& mon : monitors) {
             WCHAR text[64];
@@ -636,7 +663,7 @@ static BOOL ProcessTrackPopupMenu(
         auto monitors = GetAllMonitors();
         for (const auto& mon : monitors) {
             if (mon.index == targetMon) {
-                MoveWindowToMonitor(hWnd, mon);
+                if (hTargetWnd) MoveWindowToMonitor(hTargetWnd, mon);
                 break;
             }
         }
@@ -644,12 +671,12 @@ static BOOL ProcessTrackPopupMenu(
         return TRUE;
     } else if (selectedCmd == IDM_CUSTOM_MOVE_NEXT) {
         auto monitors = GetAllMonitors();
-        if (!monitors.empty()) {
-            int curIdx = GetWindowMonitorIndex(hWnd, monitors);
+        if (!monitors.empty() && hTargetWnd) {
+            int curIdx = GetWindowMonitorIndex(hTargetWnd, monitors);
             int nextIdx = (curIdx % static_cast<int>(monitors.size())) + 1;
             for (const auto& mon : monitors) {
                 if (mon.index == nextIdx) {
-                    MoveWindowToMonitor(hWnd, mon);
+                    MoveWindowToMonitor(hTargetWnd, mon);
                     break;
                 }
             }
@@ -666,7 +693,9 @@ static BOOL ProcessTrackPopupMenu(
     if (callerWantedReturnCmd) {
         *pResult = selectedCmd;
     } else {
-        PostMessageW(hWnd, WM_SYSCOMMAND, selectedCmd, 0);
+        if (hWnd && IsWindow(hWnd)) {
+            PostMessageW(hWnd, WM_SYSCOMMAND, selectedCmd, 0);
+        }
         *pResult = TRUE;
     }
 
@@ -708,7 +737,7 @@ BOOL WINAPI TrackPopupMenu_Hook(
 
 // ----------------------------------------------------------------------------------
 
-// Background Window Procedure
+// Background Window Procedure (Runs only in explorer.exe)
 LRESULT CALLBACK HelperWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_HOTKEY: {
@@ -746,7 +775,6 @@ LRESULT CALLBACK HelperWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
         }
 
         case WM_TIMER: {
-            // Track last active non-explorer application window
             HWND hFore = GetForegroundWindow();
             if (hFore && IsValidAppWindow(hFore)) {
                 s_hLastActiveAppWnd = hFore;
@@ -811,11 +839,12 @@ void LoadSettings() {
 }
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Move Window to Monitor initializing");
+    s_isExplorer = CheckIsExplorer();
+    Wh_Log(L"Move Window to Monitor initializing (isExplorer=%d)", s_isExplorer);
 
     LoadSettings();
 
-    // Hook TrackPopupMenuEx & TrackPopupMenu in explorer.exe for taskbar thumbnail preview menu
+    // Hook TrackPopupMenuEx & TrackPopupMenu in ALL processes so Chrome/Edge/Explorer system menus are all covered!
     HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
     if (hUser32) {
         void* pTrackPopupMenuEx = (void*)GetProcAddress(hUser32, "TrackPopupMenuEx");
@@ -828,10 +857,12 @@ BOOL Wh_ModInit() {
         }
     }
 
-    s_hThread = CreateThread(nullptr, 0, WorkerThreadProc, nullptr, 0, &s_dwThreadId);
-    if (!s_hThread) {
-        Wh_Log(L"Failed to create worker thread");
-        return FALSE;
+    // Only explorer.exe hosts the global hotkeys and tray icon thread
+    if (s_isExplorer) {
+        s_hThread = CreateThread(nullptr, 0, WorkerThreadProc, nullptr, 0, &s_dwThreadId);
+        if (!s_hThread) {
+            Wh_Log(L"Failed to create worker thread in explorer");
+        }
     }
 
     Wh_Log(L"Move Window to Monitor initialized successfully");
@@ -841,14 +872,16 @@ BOOL Wh_ModInit() {
 void Wh_ModUninit() {
     Wh_Log(L"Move Window to Monitor uninitializing");
 
-    if (s_hHelperWnd) {
-        PostMessageW(s_hHelperWnd, WM_CLOSE, 0, 0);
-    }
+    if (s_isExplorer) {
+        if (s_hHelperWnd) {
+            PostMessageW(s_hHelperWnd, WM_CLOSE, 0, 0);
+        }
 
-    if (s_hThread) {
-        WaitForSingleObject(s_hThread, 3000);
-        CloseHandle(s_hThread);
-        s_hThread = nullptr;
+        if (s_hThread) {
+            WaitForSingleObject(s_hThread, 3000);
+            CloseHandle(s_hThread);
+            s_hThread = nullptr;
+        }
     }
 }
 
@@ -857,7 +890,7 @@ void Wh_ModSettingsChanged() {
 
     LoadSettings();
 
-    if (s_hHelperWnd) {
+    if (s_isExplorer && s_hHelperWnd) {
         PostMessageW(s_hHelperWnd, WM_UPDATE_SETTINGS, 0, 0);
     }
 }
