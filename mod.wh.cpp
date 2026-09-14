@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id              move-window-to-monitor
 // @name            Move Window to Monitor
-// @description     Easily move windows between monitors using hotkeys, taskbar thumbnail/titlebar menu, or a tray menu, with one-click rescue for windows lost on disconnected displays.
+// @description     Easily move windows between monitors using hotkeys or taskbar thumbnail/titlebar menu, with one-click rescue for windows lost on disconnected displays.
 // @version         1.2.0
 // @author          heartacker
 // @github          https://github.com/heartacker
@@ -29,12 +29,8 @@
    - `Win + Alt + 3`：将当前窗口移动到显示器 3
    - `Win + Alt + ← / →`：将当前窗口移动到上一个 / 下一个显示器
    - `Win + Alt + R`：**一键召回所有窗口**（Rescue All）
-3. **任务栏系统托盘图标**：
-   - 鼠标点击右下角托盘小图标，直接呼出菜单
-   - **“运行中的应用”** 列表：即使屏幕黑了、看不到界面，也能直接在菜单里找到该 App 并一键移到指定屏幕
-4. **设置项支持**：
+3. **设置项支持**：
    - 可在 Windhawk 设置中更改快捷键组合（Win+Alt / Win+Ctrl / Win+Shift）
-   - 可开关托盘图标
    - 可开启“显示器配置变更时自动拯救窗口”
 */
 // ==/WindhawkModReadme==
@@ -48,9 +44,6 @@
     - win_alt: Win + Alt (例如 Win+Alt+1, Win+Alt+R)
     - win_ctrl: Win + Ctrl (例如 Win+Ctrl+1, Win+Ctrl+R)
     - win_shift: Win + Shift (例如 Win+Shift+1, Win+Shift+R)
-- showTrayIcon: true
-  $name: 显示任务栏托盘图标 (Show Tray Icon)
-  $description: 在系统托盘常驻一个小图标，方便随时通过鼠标菜单移动窗口
 - autoRescueOnDisplayChange: false
   $name: 显示器变化时自动拉回 (Auto rescue on display change)
   $description: 当拔掉显示器或系统显示模式改变时，自动将越界或不可见的窗口拉回主屏幕
@@ -67,7 +60,6 @@
 // Settings
 struct {
     std::wstring hotkeyModifier;
-    bool showTrayIcon;
     bool autoRescueOnDisplayChange;
 } g_settings;
 
@@ -79,13 +71,6 @@ struct MonitorInfo {
     bool isPrimary;
     int index; // 1-based index
     std::wstring name;
-};
-
-// Window info for Tray Menu
-struct AppWindowInfo {
-    HWND hWnd;
-    std::wstring title;
-    int monitorIndex; // 0 if unknown/offscreen
 };
 
 // Hotkey IDs
@@ -102,27 +87,17 @@ enum {
 
 // Menu IDs
 enum {
-    IDM_HEADER_MONITORS = 3000,
-    IDM_MOVE_MON_BASE = 3100, // 3101..3110
-    IDM_MOVE_PREV = 3200,
-    IDM_MOVE_NEXT,
-    IDM_RESCUE_ALL,
-    IDM_OPEN_SETTINGS,
-    IDM_APP_MENU_BASE = 4000, // 4000 + (appIndex * 10) + targetMonIndex
-
     // Custom Context Menu IDs
     IDM_CUSTOM_MOVE_BASE = 0xE700,
     IDM_CUSTOM_MOVE_NEXT = 0xE720,
     IDM_CUSTOM_RESCUE    = 0xE721,
 };
 
-static const UINT WM_TRAY_CALLBACK = WM_APP + 42;
 static const UINT WM_UPDATE_SETTINGS = WM_APP + 43;
 
 static HANDLE s_hThread = nullptr;
 static DWORD s_dwThreadId = 0;
 static HWND s_hHelperWnd = nullptr;
-static NOTIFYICONDATAW s_nid = {};
 static HWND s_hLastActiveAppWnd = nullptr;
 static bool s_isExplorer = false;
 
@@ -132,7 +107,6 @@ void MoveWindowToMonitor(HWND hWnd, const MonitorInfo& targetMon);
 void MoveForegroundWindowToMonitorIndex(int monitorIndex);
 void MoveForegroundWindowToPrevOrNext(bool next);
 void RescueAllWindowsToPrimary();
-void UpdateTrayIcon(bool show);
 HWND GetTrackedTargetWindow();
 
 bool CheckIsExplorer() {
@@ -429,143 +403,6 @@ void RegisterHotkeys(HWND hWnd) {
     RegisterHotKey(hWnd, HOTKEY_ID_RESCUE_HOME, mod | MOD_NOREPEAT, VK_HOME);
 }
 
-void UpdateTrayIcon(bool show) {
-    if (!s_hHelperWnd) return;
-
-    if (show) {
-        s_nid.cbSize = sizeof(s_nid);
-        s_nid.hWnd = s_hHelperWnd;
-        s_nid.uID = 1001;
-        s_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-        s_nid.uCallbackMessage = WM_TRAY_CALLBACK;
-        
-        HICON hIcon = nullptr;
-        ExtractIconExW(L"shell32.dll", 34, nullptr, &hIcon, 1);
-        if (!hIcon) {
-            hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-        }
-        s_nid.hIcon = hIcon;
-        wcscpy_s(s_nid.szTip, L"窗口换屏助手 (Move Window to Monitor)");
-
-        Shell_NotifyIconW(NIM_ADD, &s_nid);
-        Shell_NotifyIconW(NIM_SETVERSION, &s_nid);
-    } else {
-        Shell_NotifyIconW(NIM_DELETE, &s_nid);
-    }
-}
-
-static BOOL CALLBACK EnumWindowsListCallback(HWND hWnd, LPARAM lParam) {
-    if (!IsValidAppWindow(hWnd)) return TRUE;
-    auto* pList = reinterpret_cast<std::vector<AppWindowInfo>*>(lParam);
-    WCHAR title[256];
-    GetWindowTextW(hWnd, title, ARRAYSIZE(title));
-    if (wcslen(title) > 0) {
-        AppWindowInfo info;
-        info.hWnd = hWnd;
-        info.title = title;
-        info.monitorIndex = 0;
-        pList->push_back(info);
-    }
-    return TRUE;
-}
-
-// Show the Tray Context Menu
-void ShowTrayContextMenu(HWND hWndHelper) {
-    POINT pt;
-    GetCursorPos(&pt);
-
-    auto monitors = GetAllMonitors();
-    HWND hTarget = GetTrackedTargetWindow();
-
-    HMENU hMenu = CreatePopupMenu();
-
-    // 1. Current Foreground window label
-    WCHAR targetTitle[128] = L"未选择 (点击可激活窗口)";
-    if (hTarget) {
-        WCHAR rawTitle[256];
-        GetWindowTextW(hTarget, rawTitle, ARRAYSIZE(rawTitle));
-        if (wcslen(rawTitle) > 30) {
-            rawTitle[27] = L'.';
-            rawTitle[28] = L'.';
-            rawTitle[29] = L'.';
-            rawTitle[30] = L'\0';
-        }
-        int curMon = GetWindowMonitorIndex(hTarget, monitors);
-        swprintf_s(targetTitle, L"当前窗口: [%s] (屏幕 %d)", rawTitle, curMon);
-    }
-    AppendMenuW(hMenu, MF_STRING | MF_GRAYED, 0, targetTitle);
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-
-    // 2. Move current window options
-    for (const auto& mon : monitors) {
-        WCHAR text[64];
-        if (mon.isPrimary) {
-            swprintf_s(text, L"🖥️ 移至显示器 %d (主屏幕)", mon.index);
-        } else {
-            swprintf_s(text, L"🖥️ 移至显示器 %d", mon.index);
-        }
-        AppendMenuW(hMenu, (hTarget ? MF_ENABLED : MF_GRAYED) | MF_STRING, IDM_MOVE_MON_BASE + mon.index, text);
-    }
-    AppendMenuW(hMenu, (hTarget ? MF_ENABLED : MF_GRAYED) | MF_STRING, IDM_MOVE_NEXT, L"➡️ 移至下一个显示器");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-
-    // 3. Submenu: Running App Windows list
-    std::vector<AppWindowInfo> appList;
-    EnumWindows(EnumWindowsListCallback, reinterpret_cast<LPARAM>(&appList));
-
-    HMENU hAppSubMenu = CreatePopupMenu();
-    size_t maxApps = (std::min)(appList.size(), (size_t)15);
-    for (size_t i = 0; i < maxApps; ++i) {
-        appList[i].monitorIndex = GetWindowMonitorIndex(appList[i].hWnd, monitors);
-        HMENU hMonSub = CreatePopupMenu();
-        for (const auto& mon : monitors) {
-            WCHAR moveText[64];
-            swprintf_s(moveText, L"移至显示器 %d%s", mon.index, (mon.index == appList[i].monitorIndex ? L" (当前)" : L""));
-            UINT menuId = static_cast<UINT>(IDM_APP_MENU_BASE + (i * 10) + mon.index);
-            AppendMenuW(hMonSub, MF_STRING, menuId, moveText);
-        }
-        std::wstring itemLabel = appList[i].title;
-        if (itemLabel.length() > 25) {
-            itemLabel = itemLabel.substr(0, 22) + L"...";
-        }
-        WCHAR formattedAppLabel[64];
-        swprintf_s(formattedAppLabel, L"[%d屏] %s", appList[i].monitorIndex, itemLabel.c_str());
-        AppendMenuW(hAppSubMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hMonSub), formattedAppLabel);
-    }
-    if (appList.empty()) {
-        AppendMenuW(hAppSubMenu, MF_GRAYED | MF_STRING, 0, L"(无检测到的窗口)");
-    }
-    AppendMenuW(hMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hAppSubMenu), L"🪟 正在运行的窗口列表");
-    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
-
-    // 4. Rescue All Windows
-    AppendMenuW(hMenu, MF_STRING, IDM_RESCUE_ALL, L"🔄 一键召回所有窗口到主显示器 (Rescue)");
-
-    // Ensure menu behaves properly on click outside
-    SetForegroundWindow(hWndHelper);
-    int cmd = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, hWndHelper, nullptr);
-    DestroyMenu(hMenu);
-
-    if (cmd >= IDM_MOVE_MON_BASE + 1 && cmd <= IDM_MOVE_MON_BASE + 10) {
-        MoveForegroundWindowToMonitorIndex(cmd - IDM_MOVE_MON_BASE);
-    } else if (cmd == IDM_MOVE_NEXT) {
-        MoveForegroundWindowToPrevOrNext(true);
-    } else if (cmd == IDM_RESCUE_ALL) {
-        RescueAllWindowsToPrimary();
-    } else if (cmd >= IDM_APP_MENU_BASE) {
-        int appIdx = (cmd - IDM_APP_MENU_BASE) / 10;
-        int targetMonIdx = (cmd - IDM_APP_MENU_BASE) % 10;
-        if (appIdx >= 0 && appIdx < static_cast<int>(appList.size())) {
-            for (const auto& mon : monitors) {
-                if (mon.index == targetMonIdx) {
-                    MoveWindowToMonitor(appList[appIdx].hWnd, mon);
-                    break;
-                }
-            }
-        }
-    }
-}
-
 // ----------------------------------------------------------------------------------
 // Taskbar Thumbnail / Window System Menu Hooking via TrackPopupMenuEx & TrackPopupMenu
 // ----------------------------------------------------------------------------------
@@ -761,16 +598,8 @@ LRESULT CALLBACK HelperWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
             return 0;
         }
 
-        case WM_TRAY_CALLBACK: {
-            if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP) {
-                ShowTrayContextMenu(hWnd);
-            }
-            return 0;
-        }
-
         case WM_UPDATE_SETTINGS: {
             RegisterHotkeys(hWnd);
-            UpdateTrayIcon(g_settings.showTrayIcon);
             return 0;
         }
 
@@ -791,7 +620,7 @@ LRESULT CALLBACK HelperWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-// Worker thread for handling tray icon, messages, and hotkeys
+// Worker thread for handling background messages and hotkeys
 DWORD WINAPI WorkerThreadProc(LPVOID) {
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.lpfnWndProc = HelperWndProc;
@@ -814,7 +643,6 @@ DWORD WINAPI WorkerThreadProc(LPVOID) {
     if (!s_hHelperWnd) return 1;
 
     RegisterHotkeys(s_hHelperWnd);
-    UpdateTrayIcon(g_settings.showTrayIcon);
 
     // Timer every 300ms to poll active application window
     SetTimer(s_hHelperWnd, 1, 300, nullptr);
@@ -825,7 +653,6 @@ DWORD WINAPI WorkerThreadProc(LPVOID) {
         DispatchMessageW(&msg);
     }
 
-    UpdateTrayIcon(false);
     return 0;
 }
 
@@ -834,7 +661,6 @@ void LoadSettings() {
     g_settings.hotkeyModifier = modifier ? modifier : L"win_alt";
     Wh_FreeStringSetting(modifier);
 
-    g_settings.showTrayIcon = Wh_GetIntSetting(L"showTrayIcon") != 0;
     g_settings.autoRescueOnDisplayChange = Wh_GetIntSetting(L"autoRescueOnDisplayChange") != 0;
 }
 
@@ -857,7 +683,7 @@ BOOL Wh_ModInit() {
         }
     }
 
-    // Only explorer.exe hosts the global hotkeys and tray icon thread
+    // Only explorer.exe hosts the global hotkeys and helper thread
     if (s_isExplorer) {
         s_hThread = CreateThread(nullptr, 0, WorkerThreadProc, nullptr, 0, &s_dwThreadId);
         if (!s_hThread) {
