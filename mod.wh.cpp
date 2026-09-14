@@ -2,7 +2,7 @@
 // @id              move-window-to-monitor
 // @name            Move Window to Monitor
 // @description     Easily move windows between monitors using hotkeys or a tray menu, with one-click rescue for windows lost on disconnected displays.
-// @version         1.0.0
+// @version         1.1.0
 // @author          heartacker
 // @github          https://github.com/heartacker
 // @include         explorer.exe
@@ -16,18 +16,22 @@
 专为多显示器、外接屏幕断开/虚显（幽灵屏）、向日葵等远程控制场景打造的窗口调度与救援工具。
 
 ### 核心功能：
-1. **全局快捷键**：
+1. **任务栏缩略图预览菜单（右键预览框）**：
+   - 鼠标悬停在任务栏图标上，右键点击弹出的缩略图预览窗口，菜单中直接新增：
+     - `🖥️ 移至显示器 1 (主屏幕)`
+     - `🖥️ 移至显示器 2`
+     - `➡️ 移至下一个显示器`
+     - `🔄 召回所有窗口到主屏幕`
+2. **全局快捷键**：
    - `Win + Alt + 1`：将当前窗口移动到显示器 1（主屏）
    - `Win + Alt + 2`：将当前窗口移动到显示器 2
    - `Win + Alt + 3`：将当前窗口移动到显示器 3
    - `Win + Alt + ← / →`：将当前窗口移动到上一个 / 下一个显示器
-   - `Win + Alt + R`：**一键召回所有窗口**（Rescue All），一键把所有落在黑屏/外接屏上的窗口拉回主显示器可视区域
-2. **任务栏系统托盘图标**：
-   - 鼠标右键或左键点击托盘小图标，直接呼出菜单
-   - 支持移动当前焦点窗口到指定显示器
+   - `Win + Alt + R`：**一键召回所有窗口**（Rescue All）
+3. **任务栏系统托盘图标**：
+   - 鼠标点击右下角托盘小图标，直接呼出菜单
    - **“运行中的应用”** 列表：即使屏幕黑了、看不到界面，也能直接在菜单里找到该 App 并一键移到指定屏幕
-   - “一键召回所有窗口到主显示器”
-3. **设置项支持**：
+4. **设置项支持**：
    - 可在 Windhawk 设置中更改快捷键组合（Win+Alt / Win+Ctrl / Win+Shift）
    - 可开关托盘图标
    - 可开启“显示器配置变更时自动拯救窗口”
@@ -104,6 +108,11 @@ enum {
     IDM_RESCUE_ALL,
     IDM_OPEN_SETTINGS,
     IDM_APP_MENU_BASE = 4000, // 4000 + (appIndex * 10) + targetMonIndex
+
+    // Custom Taskbar Thumbnail Context Menu IDs (0xE700 - 0xE750)
+    IDM_CUSTOM_MOVE_BASE = 0xE700,
+    IDM_CUSTOM_MOVE_NEXT = 0xE720,
+    IDM_CUSTOM_RESCUE    = 0xE721,
 };
 
 static const UINT WM_TRAY_CALLBACK = WM_APP + 42;
@@ -541,6 +550,164 @@ void ShowTrayContextMenu(HWND hWndHelper) {
     }
 }
 
+// ----------------------------------------------------------------------------------
+// Taskbar Thumbnail / System Menu Hooking via TrackPopupMenuEx & TrackPopupMenu
+// ----------------------------------------------------------------------------------
+
+using TrackPopupMenuEx_t = BOOL(WINAPI*)(HMENU, UINT, int, int, HWND, LPTPMPARAMS);
+static TrackPopupMenuEx_t TrackPopupMenuEx_Original = nullptr;
+
+using TrackPopupMenu_t = BOOL(WINAPI*)(HMENU, UINT, int, int, int, HWND, const RECT*);
+static TrackPopupMenu_t TrackPopupMenu_Original = nullptr;
+
+static BOOL ProcessTrackPopupMenu(
+    HMENU hMenu,
+    UINT uFlags,
+    int x,
+    int y,
+    HWND hWnd,
+    LPTPMPARAMS lptpm,
+    BOOL isEx,
+    int nReserved,
+    const RECT* prcRect,
+    BOOL* pHandled,
+    BOOL* pResult
+) {
+    if (!hMenu || !hWnd || !IsWindow(hWnd)) {
+        *pHandled = FALSE;
+        return FALSE;
+    }
+
+    // Check if this menu is a window system/thumbnail menu (contains SC_CLOSE, SC_RESTORE, or SC_MINIMIZE)
+    bool isSystemOrThumbMenu = (GetMenuState(hMenu, SC_CLOSE, MF_BYCOMMAND) != (UINT)-1) ||
+                               (GetMenuState(hMenu, SC_RESTORE, MF_BYCOMMAND) != (UINT)-1) ||
+                               (GetMenuState(hMenu, SC_MINIMIZE, MF_BYCOMMAND) != (UINT)-1);
+
+    if (!isSystemOrThumbMenu) {
+        *pHandled = FALSE;
+        return FALSE;
+    }
+
+    Wh_Log(L"ProcessTrackPopupMenu detected system/thumbnail menu for hWnd=%p", hWnd);
+
+    // If not already appended, add our menu items
+    if (GetMenuState(hMenu, IDM_CUSTOM_MOVE_NEXT, MF_BYCOMMAND) == (UINT)-1) {
+        AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+
+        auto monitors = GetAllMonitors();
+        int curMon = GetWindowMonitorIndex(hWnd, monitors);
+
+        for (const auto& mon : monitors) {
+            WCHAR text[64];
+            if (mon.isPrimary) {
+                swprintf_s(text, L"🖥️ 移至显示器 %d (主屏)%s", mon.index, (mon.index == curMon ? L" [当前]" : L""));
+            } else {
+                swprintf_s(text, L"🖥️ 移至显示器 %d%s", mon.index, (mon.index == curMon ? L" [当前]" : L""));
+            }
+            AppendMenuW(hMenu, MF_STRING, IDM_CUSTOM_MOVE_BASE + mon.index, text);
+        }
+        AppendMenuW(hMenu, MF_STRING, IDM_CUSTOM_MOVE_NEXT, L"➡️ 移至下一个显示器");
+        AppendMenuW(hMenu, MF_STRING, IDM_CUSTOM_RESCUE, L"🔄 召回所有窗口到主屏幕");
+    }
+
+    // Force TPM_RETURNCMD so we can catch our own custom command IDs
+    BOOL callerWantedReturnCmd = (uFlags & TPM_RETURNCMD) != 0;
+    UINT invokeFlags = uFlags | TPM_RETURNCMD;
+
+    int selectedCmd = 0;
+    if (isEx) {
+        selectedCmd = TrackPopupMenuEx_Original(hMenu, invokeFlags, x, y, hWnd, lptpm);
+    } else {
+        selectedCmd = TrackPopupMenu_Original(hMenu, invokeFlags, x, y, nReserved, hWnd, prcRect);
+    }
+
+    Wh_Log(L"ProcessTrackPopupMenu selectedCmd=0x%X", selectedCmd);
+
+    *pHandled = TRUE;
+
+    if (selectedCmd == 0) {
+        *pResult = callerWantedReturnCmd ? 0 : TRUE;
+        return TRUE;
+    }
+
+    // Check if user selected one of our custom items
+    if (selectedCmd >= IDM_CUSTOM_MOVE_BASE + 1 && selectedCmd <= IDM_CUSTOM_MOVE_BASE + 10) {
+        int targetMon = selectedCmd - IDM_CUSTOM_MOVE_BASE;
+        auto monitors = GetAllMonitors();
+        for (const auto& mon : monitors) {
+            if (mon.index == targetMon) {
+                MoveWindowToMonitor(hWnd, mon);
+                break;
+            }
+        }
+        *pResult = callerWantedReturnCmd ? 0 : TRUE;
+        return TRUE;
+    } else if (selectedCmd == IDM_CUSTOM_MOVE_NEXT) {
+        auto monitors = GetAllMonitors();
+        if (!monitors.empty()) {
+            int curIdx = GetWindowMonitorIndex(hWnd, monitors);
+            int nextIdx = (curIdx % static_cast<int>(monitors.size())) + 1;
+            for (const auto& mon : monitors) {
+                if (mon.index == nextIdx) {
+                    MoveWindowToMonitor(hWnd, mon);
+                    break;
+                }
+            }
+        }
+        *pResult = callerWantedReturnCmd ? 0 : TRUE;
+        return TRUE;
+    } else if (selectedCmd == IDM_CUSTOM_RESCUE) {
+        RescueAllWindowsToPrimary();
+        *pResult = callerWantedReturnCmd ? 0 : TRUE;
+        return TRUE;
+    }
+
+    // Standard Win32 system command (SC_CLOSE, SC_RESTORE, etc.)
+    if (callerWantedReturnCmd) {
+        *pResult = selectedCmd;
+    } else {
+        PostMessageW(hWnd, WM_SYSCOMMAND, selectedCmd, 0);
+        *pResult = TRUE;
+    }
+
+    return TRUE;
+}
+
+BOOL WINAPI TrackPopupMenuEx_Hook(
+    HMENU hMenu,
+    UINT uFlags,
+    int x,
+    int y,
+    HWND hWnd,
+    LPTPMPARAMS lptpm
+) {
+    BOOL handled = FALSE;
+    BOOL result = FALSE;
+    if (ProcessTrackPopupMenu(hMenu, uFlags, x, y, hWnd, lptpm, TRUE, 0, nullptr, &handled, &result)) {
+        return result;
+    }
+    return TrackPopupMenuEx_Original(hMenu, uFlags, x, y, hWnd, lptpm);
+}
+
+BOOL WINAPI TrackPopupMenu_Hook(
+    HMENU hMenu,
+    UINT uFlags,
+    int x,
+    int y,
+    int nReserved,
+    HWND hWnd,
+    const RECT* prcRect
+) {
+    BOOL handled = FALSE;
+    BOOL result = FALSE;
+    if (ProcessTrackPopupMenu(hMenu, uFlags, x, y, hWnd, nullptr, FALSE, nReserved, prcRect, &handled, &result)) {
+        return result;
+    }
+    return TrackPopupMenu_Original(hMenu, uFlags, x, y, nReserved, hWnd, prcRect);
+}
+
+// ----------------------------------------------------------------------------------
+
 // Background Window Procedure
 LRESULT CALLBACK HelperWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -647,6 +814,19 @@ BOOL Wh_ModInit() {
     Wh_Log(L"Move Window to Monitor initializing");
 
     LoadSettings();
+
+    // Hook TrackPopupMenuEx & TrackPopupMenu in explorer.exe for taskbar thumbnail preview menu
+    HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+    if (hUser32) {
+        void* pTrackPopupMenuEx = (void*)GetProcAddress(hUser32, "TrackPopupMenuEx");
+        if (pTrackPopupMenuEx) {
+            Wh_SetFunctionHook(pTrackPopupMenuEx, (void*)TrackPopupMenuEx_Hook, (void**)&TrackPopupMenuEx_Original);
+        }
+        void* pTrackPopupMenu = (void*)GetProcAddress(hUser32, "TrackPopupMenu");
+        if (pTrackPopupMenu) {
+            Wh_SetFunctionHook(pTrackPopupMenu, (void*)TrackPopupMenu_Hook, (void**)&TrackPopupMenu_Original);
+        }
+    }
 
     s_hThread = CreateThread(nullptr, 0, WorkerThreadProc, nullptr, 0, &s_dwThreadId);
     if (!s_hThread) {
