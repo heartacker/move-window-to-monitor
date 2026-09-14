@@ -1,6 +1,6 @@
 {
     "windhawk.editedModId": "move-window-to-monitor",
-    "windhawk.editedModWasModified": true,
+    "windhawk.editedModWasModified": false,
     "git.enabled": true,
     "workbench.editor.showTabs": true,
     "workbench.statusBar.visible": true,
