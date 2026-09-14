@@ -1,0 +1,5 @@
+# To change formatting for all Windhawk editor workspaces, create a
+# .clang-format.windhawk file in the parent folder with the desired settings.
+BasedOnStyle: Chromium
+IndentWidth: 4
+CommentPragmas: ^[ \t]+@[a-zA-Z]+
